@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime output
+class_crawler/filtered_articles_content.json
+class_crawler/article_state.json
+filtered_articles_content.json
+article_state.json
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+*.pkg
+*.pyz
+*.toc
+*.manifest
+
+# Data dumps
+*.pkl
+*.csv
+测试多余的数据/
+class_crawler/测试多余的数据/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
