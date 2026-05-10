@@ -1,149 +1,142 @@
-import requests
-import math
-import time
-import random
+import argparse
 import json
+import math
+import os
+import random
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm  # 用于进度条
+from pathlib import Path
 
-# ———— 配置区 ————
+import requests
+from tqdm import tqdm
+
 URL_LIST = "https://mp.weixin.qq.com/cgi-bin/appmsg"
-
-# 请替换为你从公众号后台 F12 Network 拷到的有效 Cookie
-COOKIE = "你的 COOKIE"
-
-# 请替换为你的 token 和 fakeid
-TOKEN = "你的 token"
-FAKEID = "fakeid"
-
-# 每页抓 10 条（微信接口最大支持 10）
 PER_PAGE = 10
-# 并发线程数，可根据网络情况调整
-MAX_WORKERS = 5
-
-# 筛选标题时的关键字
-KEYWORD = "关键字"
-
-# ———— 构造正则模式 ————
-# 将 KEYWORD 拆成一个个字符，用 '.*' 串联，得到 like "本.*科.*展"
-# re.escape 确保如果 KEYWORD 中包含特殊字符（如 .、*、? 等）也能正确转义
-pattern = ".*".join(map(re.escape, KEYWORD))
-# 编译一个忽略大小写的正则，匹配模式：只要 title 中依次出现 KEYWORD 的各字符即可
-regex = re.compile(pattern, flags=re.IGNORECASE)
-
-# ———— 初始化 Session & 基础参数 ————
-session = requests.Session()
-session.headers.update({
-    "Cookie": COOKIE,
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/90.0.4430.212 Safari/537.36"
-    )
-})
-
-base_params = {
-    "token": TOKEN,
-    "lang": "zh_CN",
-    "f": "json",
-    "ajax": "1",
-    "action": "list_ex",
-    "begin": "0",
-    "count": str(PER_PAGE),
-    "query": "",
-    "fakeid": FAKEID,
-    "type": "9",
-}
 
 
-def get_total_count():
-    """
-    第一次请求只拿 app_msg_cnt，以便估算总页数。
-    返回公众号标示的总文章数（int），或 0 如果失败。
-    """
-    try:
-        resp = session.get(URL_LIST, params=base_params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+def build_regex(keyword: str) -> re.Pattern:
+    pattern = ".*".join(map(re.escape, keyword))
+    return re.compile(pattern, flags=re.IGNORECASE)
+
+
+def require_value(name: str, value: str) -> str:
+    if not value:
+        raise RuntimeError(f"缺少配置 {name}，请在环境变量或命令行参数中提供。")
+    return value
+
+
+class WeChatArticleCrawler:
+    def __init__(self, cookie: str, token: str, fakeid: str, keyword: str, workers: int = 5):
+        self.cookie = require_value("WX_COOKIE", cookie)
+        self.token = require_value("WX_TOKEN", token)
+        self.fakeid = require_value("WX_FAKEID", fakeid)
+        self.keyword = require_value("WX_KEYWORD", keyword)
+        self.workers = max(1, workers)
+        self.regex = build_regex(self.keyword)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Cookie": self.cookie,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/90.0.4430.212 Safari/537.36"
+            ),
+        })
+
+    @property
+    def base_params(self) -> dict[str, str]:
+        return {
+            "token": self.token,
+            "lang": "zh_CN",
+            "f": "json",
+            "ajax": "1",
+            "action": "list_ex",
+            "begin": "0",
+            "count": str(PER_PAGE),
+            "query": "",
+            "fakeid": self.fakeid,
+            "type": "9",
+        }
+
+    def get_total_count(self) -> int:
+        response = self.session.get(URL_LIST, params=self.base_params, timeout=15)
+        response.raise_for_status()
+        data = response.json()
         return int(data.get("app_msg_cnt", 0))
-    except Exception:
-        return 0
 
+    def fetch_one_page(self, offset: int) -> list[dict]:
+        params = self.base_params.copy()
+        params["begin"] = str(offset)
+        try:
+            response = self.session.get(URL_LIST, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("app_msg_list", []) or []
+        except Exception as exc:
+            print(f"抓取 offset={offset} 失败: {exc}")
+            return []
 
-def fetch_one_page(offset):
-    """
-    根据 offset（即 begin）拉取一页列表：返回该页的 app_msg_list（list）。
-    如果请求失败或没有数据，则返回空 list。
-    """
-    params = base_params.copy()
-    params["begin"] = str(offset)
-    try:
-        r = session.get(URL_LIST, params=params, timeout=10)
-        r.raise_for_status()
-        j = r.json()
-        return j.get("app_msg_list", []) or []
-    except Exception:
-        return []
+    def collect_filtered_links(self) -> list[dict]:
+        total = self.get_total_count()
+        if total <= 0:
+            print("未能获取文章总数，请检查 Cookie、token 和 fakeid 是否有效。")
+            return []
 
+        offsets = [index * PER_PAGE for index in range(math.ceil(total / PER_PAGE))]
+        filtered: list[dict] = []
+        empty_streak = 0
 
-def collect_filtered_links():
-    """
-    1. 获取 app_msg_cnt，计算理论页数；
-    2. 并发地对每个 offset 发 fetch_one_page，带进度条显示进度；
-    3. 在每页结果里用正则 regex 搜索 title，只要按顺序出现 KEYWORD 中各字符即可，
-       即可收集 {title, link, create_time}。
-    """
-    total = get_total_count()
-    if total <= 0:
-        print("→ 未能获取到文章总数，退出。")
-        return []
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {executor.submit(self.fetch_one_page, offset): offset for offset in offsets}
+            for future in tqdm(as_completed(futures), total=len(offsets), desc="分页抓取进度"):
+                page_items = future.result()
+                if not page_items:
+                    empty_streak += 1
+                    if empty_streak >= 3:
+                        break
+                    continue
 
-    page_count = math.ceil(total / PER_PAGE)
-    offsets = [i * PER_PAGE for i in range(page_count)]
-
-    filtered = []
-    empty_streak = 0
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_one_page, off): off for off in offsets}
-
-        # tqdm 跟踪 as_completed 的进度，总数为 len(offsets)
-        for future in tqdm(as_completed(futures),
-                           total=len(offsets),
-                           desc="分页抓取进度"):
-            page_items = future.result()
-            if not page_items:
-                empty_streak += 1
-                # 连续 3 次都没内容，就停止
-                if empty_streak >= 3:
-                    break
-            else:
                 empty_streak = 0
-                for it in page_items:
-                    title = it.get("title", "")
-                    # 用预先编译好的 regex 去匹配标题
-                    if regex.search(title):
+                for item in page_items:
+                    title = item.get("title", "")
+                    if self.regex.search(title):
                         filtered.append({
                             "title": title,
-                            "link": it.get("link", ""),
-                            "create_time": it.get("create_time", 0)
+                            "link": item.get("link", ""),
+                            "create_time": item.get("create_time", 0),
                         })
-            # 防风控，短暂随机休眠
-            time.sleep(random.uniform(0.05, 0.15))
+                time.sleep(random.uniform(0.05, 0.15))
 
-    return filtered
+        return filtered
 
 
-def main():
-    results = collect_filtered_links()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="按标题关键词抓取微信公众号文章列表。")
+    parser.add_argument("--cookie", default=os.getenv("WX_COOKIE", ""), help="微信公众号后台 Cookie")
+    parser.add_argument("--token", default=os.getenv("WX_TOKEN", ""), help="微信公众号后台 token")
+    parser.add_argument("--fakeid", default=os.getenv("WX_FAKEID", ""), help="公众号 fakeid")
+    parser.add_argument("--keyword", default=os.getenv("WX_KEYWORD", ""), help="标题筛选关键词")
+    parser.add_argument("--workers", type=int, default=int(os.getenv("WX_MAX_WORKERS", "5")))
+    parser.add_argument(
+        "--output",
+        default=os.getenv("WX_OUTPUT", "filtered_articles_content.json"),
+        help="输出 JSON 文件名",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    crawler = WeChatArticleCrawler(args.cookie, args.token, args.fakeid, args.keyword, args.workers)
+    results = crawler.collect_filtered_links()
     if not results:
-        print("→ 没有筛出符合条件的文章。")
+        print("没有筛出符合条件的文章。")
         return
 
-    with open("filtered_articles_content.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=4)
-    print(f"→ 已保存 {len(results)} 条到 filtered_articles_content.json")
+    output_path = Path(args.output)
+    output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"已保存 {len(results)} 条文章到 {output_path}")
 
 
 if __name__ == "__main__":
